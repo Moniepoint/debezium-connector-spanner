@@ -54,7 +54,11 @@ public class TakePartitionForStreamingOperation implements Operation {
         try {
             Set<String> toSchedule = new HashSet<>();
 
-            toStreaming.forEach(partitionState -> {
+            for (PartitionState partitionState : toStreaming) {
+                if (Thread.currentThread().isInterrupted()) {
+                    LOGGER.info("Task {}, stopping partition submission - thread was interrupted", taskSyncContext.getTaskUid());
+                    break;
+                }
                 LOGGER.info("Task {}, submitting the partition for streaming {}", taskSyncContext.getTaskUid(), partitionState);
                 if (this.submitPartition(partitionState, taskSyncContext)) {
                     toSchedule.add(partitionState.getToken());
@@ -63,8 +67,7 @@ public class TakePartitionForStreamingOperation implements Operation {
                     LOGGER.error("Task {}, failed to submit partition {} with state {}", taskSyncContext.getTaskUid(), partitionState,
                             taskSyncContext.getRebalanceState());
                 }
-
-            });
+            }
 
             List<PartitionState> partitions = taskState.getPartitions().stream()
                     .map(partitionState -> {
