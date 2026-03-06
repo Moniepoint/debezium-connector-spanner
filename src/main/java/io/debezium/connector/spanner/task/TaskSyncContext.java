@@ -10,11 +10,13 @@ import static org.slf4j.LoggerFactory.getLogger;
 
 import java.time.Instant;
 import java.util.AbstractMap;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 
@@ -79,7 +81,7 @@ public class TaskSyncContext {
     // Builds a new epoch message, which will contain all task states.
     public TaskSyncEvent buildNewEpochTaskSyncEvent() {
         return TaskSyncEvent.builder().epochOffset(this.epochOffsetHolder.getEpochOffset()).taskStates(
-                this.getAllTaskStates())
+                pruneTaskStatesForWire(this.getAllTaskStates()))
                 .taskUid(this.getTaskUid())
                 .consumerId(this.getConsumerId())
                 .rebalanceGenerationId(this.getRebalanceGenerationId())
@@ -92,7 +94,7 @@ public class TaskSyncContext {
     // Builds an epoch update message, which will contain all task states.
     public TaskSyncEvent buildUpdateEpochTaskSyncEvent() {
         return TaskSyncEvent.builder().epochOffset(this.epochOffsetHolder.getEpochOffset()).taskStates(
-                this.getAllTaskStates())
+                pruneTaskStatesForWire(this.getAllTaskStates()))
                 .taskUid(this.getTaskUid())
                 .consumerId(this.getConsumerId())
                 .rebalanceGenerationId(this.getRebalanceGenerationId())
@@ -100,6 +102,51 @@ public class TaskSyncContext {
                 .messageType(MessageTypeEnum.UPDATE_EPOCH)
                 .databaseSchemaTimestamp(databaseSchemaTimestamp)
                 .build();
+    }
+
+    /**
+     * Strips terminal partition states from the map before it is serialized to the sync topic.
+     *
+     * REMOVED partitions are dropped unconditionally: removal is decided locally by each task;
+     * no remote task needs to receive a REMOVED state to act correctly.
+     *
+     * FINISHED partitions are kept only when at least one CREATED partition anywhere in the
+     * combined state still lists the token as a parent. Once every child has advanced past
+     * CREATED the FINISHED record carries no information and is safe to omit; the existing
+     * atLeastOneParentExists() fallback in FindPartitionForStreamingOperation handles the
+     * case where a parent token is absent from all task states.
+     */
+    private Map<String, TaskState> pruneTaskStatesForWire(Map<String, TaskState> allStates) {
+        Set<String> neededParents = allStates.values().stream()
+                .flatMap(ts -> Stream.concat(ts.getPartitions().stream(), ts.getSharedPartitions().stream()))
+                .filter(p -> p.getState() == PartitionStateEnum.CREATED && p.getParents() != null)
+                .flatMap(p -> p.getParents().stream())
+                .collect(Collectors.toSet());
+
+        return allStates.entrySet().stream()
+                .collect(Collectors.toMap(Map.Entry::getKey, e -> pruneTaskState(e.getValue(), neededParents)));
+    }
+
+    private static TaskState pruneTaskState(TaskState ts, Set<String> neededParents) {
+        return ts.toBuilder()
+                .partitions(filterPartitions(ts.getPartitions(), neededParents))
+                .sharedPartitions(filterPartitions(ts.getSharedPartitions(), neededParents))
+                .build();
+    }
+
+    private static List<PartitionState> filterPartitions(Collection<PartitionState> partitions,
+                                                         Set<String> neededParents) {
+        return partitions.stream()
+                .filter(p -> {
+                    if (p.getState() == PartitionStateEnum.REMOVED) {
+                        return false;
+                    }
+                    if (p.getState() == PartitionStateEnum.FINISHED) {
+                        return neededParents.contains(p.getToken());
+                    }
+                    return true;
+                })
+                .collect(Collectors.toList());
     }
 
     // Builds a rebalance answer task sync event, which will contain only the current task state.
