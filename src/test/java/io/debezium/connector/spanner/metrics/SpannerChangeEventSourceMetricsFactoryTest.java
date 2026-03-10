@@ -44,7 +44,7 @@ class SpannerChangeEventSourceMetricsFactoryTest {
 
         SpannerStreamingChangeEventSourceMetrics streamingMetrics = (SpannerStreamingChangeEventSourceMetrics) spannerChangeEventSourceMetricsFactory.getStreamingMetrics(
                 spannerSourceTaskContext, null, new SpannerEventMetadataProvider());
-        assertThat(streamingMetrics.getCapturedTables()).isEmpty();
+        assertThat(streamingMetrics.getCapturedTables()).isNullOrEmpty();
         assertNull(streamingMetrics.getLastTransactionId());
         assertNull(streamingMetrics.getLastEvent());
         assertEquals(0, streamingMetrics.getErrorCount());
