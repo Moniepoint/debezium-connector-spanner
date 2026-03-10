@@ -10,3 +10,9 @@
 .cache
 .settings/
 /target/
+.DS_Store
+/*.log
+/*.yaml
+/*.yml
+/*.conf
+/*.properties

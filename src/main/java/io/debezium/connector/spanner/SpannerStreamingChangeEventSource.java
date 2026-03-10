@@ -16,6 +16,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.cloud.Timestamp;
+import com.google.cloud.spanner.ErrorCode;
+import com.google.cloud.spanner.SpannerException;
 import com.google.common.annotations.VisibleForTesting;
 
 import io.debezium.connector.spanner.context.offset.SpannerOffsetContext;
@@ -140,9 +142,15 @@ public class SpannerStreamingChangeEventSource implements CommittingRecordsStrea
 
                 @Override
                 public void onException(Partition partition, Exception exception) throws InterruptedException {
-                    LOGGER.error("Try to stream again from partition {} after exception {}", partition.getToken(),
-                            exception.getMessage());
-
+                    if (exception instanceof SpannerException
+                            && ((SpannerException) exception).getErrorCode() == ErrorCode.CANCELLED) {
+                        LOGGER.warn("Partition {} streaming was cancelled (task stop/restart), will retry",
+                                partition.getToken());
+                    }
+                    else {
+                        LOGGER.error("Try to stream again from partition {} after exception {}", partition.getToken(),
+                                exception.getMessage());
+                    }
                     partitionManager.updateToReadyForStreaming(partition.getToken());
                 }
 

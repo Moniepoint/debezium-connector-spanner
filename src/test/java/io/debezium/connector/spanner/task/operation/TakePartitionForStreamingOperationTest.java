@@ -200,6 +200,45 @@ class TakePartitionForStreamingOperationTest {
                 .isEqualTo(3);
     }
 
+    /**
+     * When the ChangeStream is not yet running (isRunning=false), submitPartition() returns false.
+     * This is a transient window during task/epoch restart — the partition must stay in
+     * READY_FOR_STREAMING so the next sync event retries submission automatically.
+     * No sync event should be published (nothing was scheduled).
+     */
+    @Test
+    void whenChangeStreamNotRunning_allPartitionsStayReadyForStreamingForRetry() {
+        PartitionFactory partitionFactory = new PartitionFactory(null, new MetricsEventPublisher()) {
+            @Override
+            public Partition getPartition(PartitionState ps) {
+                return buildPartition(ps.getToken());
+            }
+        };
+
+        ChangeStream changeStream = mock(ChangeStream.class);
+        when(changeStream.submitPartition(any())).thenReturn(false); // stream not yet running
+
+        TaskSyncContext context = buildContextWithReadyPartitions(3);
+        TakePartitionForStreamingOperation op = new TakePartitionForStreamingOperation(changeStream, partitionFactory);
+        TaskSyncContext result = op.doOperation(context);
+
+        // All 3 were attempted (no interrupt)
+        verify(changeStream, times(3)).submitPartition(any());
+
+        // None transitioned to SCHEDULED — stay READY_FOR_STREAMING for the next retry
+        long readyCount = result.getCurrentTaskState().getPartitions().stream()
+                .filter(p -> p.getState() == PartitionStateEnum.READY_FOR_STREAMING)
+                .count();
+        assertThat(readyCount)
+                .as("partitions must stay READY_FOR_STREAMING when stream is not running")
+                .isEqualTo(3);
+
+        // No sync event published — nothing was scheduled
+        assertThat(op.isRequiredPublishSyncEvent())
+                .as("no sync event should be published when no partition was scheduled")
+                .isFalse();
+    }
+
     // ---- helpers ----
 
     private Partition buildPartition(String token) {

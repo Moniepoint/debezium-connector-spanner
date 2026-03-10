@@ -545,6 +545,13 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>-Xmx1024m -Dnet.bytebuddy.experimental=true</argLine>
+                </configuration>
+            </plugin>
         </plugins>
         <resources>
             <!-- Apply the properties set in the POM to the resource files -->
@@ -680,7 +687,7 @@
                             <redirectTestOutputToFile>true</redirectTestOutputToFile>
                             <forkCount>3</forkCount>
                             <reuseForks>true</reuseForks>
-                            <argLine>${surefireArgLine} -Xmx1024m -noverify</argLine>
+                            <argLine>${surefireArgLine} -Xmx1024m -noverify -Dnet.bytebuddy.experimental=true</argLine>
                         </configuration>
                     </plugin>
                     <!-- <plugin>
@@ -691,7 +698,7 @@
                             <redirectTestOutputToFile>true</redirectTestOutputToFile>
                             <forkCount>3</forkCount>
                             <reuseForks>true</reuseForks>
-                            <argLine>${surefireArgLine} -Xmx1024m -noverify</argLine>
+                            <argLine>${surefireArgLine} -Xmx1024m -noverify -Dnet.bytebuddy.experimental=true</argLine>
                         </configuration>
                     </plugin> -->
                     <plugin>

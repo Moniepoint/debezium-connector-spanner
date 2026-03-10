@@ -64,7 +64,7 @@ public class TakePartitionForStreamingOperation implements Operation {
                     toSchedule.add(partitionState.getToken());
                 }
                 else {
-                    LOGGER.error("Task {}, failed to submit partition {} with state {}", taskSyncContext.getTaskUid(), partitionState,
+                    LOGGER.warn("Task {}, failed to submit partition {} with state {}", taskSyncContext.getTaskUid(), partitionState,
                             taskSyncContext.getRebalanceState());
                 }
             }

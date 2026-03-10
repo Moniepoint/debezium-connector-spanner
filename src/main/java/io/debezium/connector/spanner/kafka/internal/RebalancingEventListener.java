@@ -126,7 +126,7 @@ public class RebalancingEventListener {
                         }
                     }
                     catch (org.apache.kafka.common.errors.InterruptException e) {
-                        LOGGER.error("Task Uid {} caught exception when interrupting RebalancingEventListener", task, e);
+                        LOGGER.warn("Task Uid {} caught exception when interrupting RebalancingEventListener", task, e);
                         Thread.currentThread().interrupt();
                         return;
                     }
@@ -134,8 +134,10 @@ public class RebalancingEventListener {
 
             }
             finally {
-                LOGGER.info("Task {} - lost connectivity to rebalance topic", task.getTaskUid());
-                errorHandler.accept(new SpannerConnectorException("Error during poll from the Rebalance Topic"));
+                if (!Thread.currentThread().isInterrupted()) {
+                    LOGGER.info("Task {} - lost connectivity to rebalance topic", task.getTaskUid());
+                    errorHandler.accept(new SpannerConnectorException("Error during poll from the Rebalance Topic"));
+                }
                 try {
                     LOGGER.info("Task {} - unsubscribing rebalance handling consumer", task.getTaskUid());
                     consumer.unsubscribe();
@@ -146,7 +148,7 @@ public class RebalancingEventListener {
                     return;
                 }
                 catch (org.apache.kafka.common.errors.InterruptException e) {
-                    LOGGER.error("Task Uid {} caught exception when interrupting RebalancingEventListener", task.getTaskUid(), e);
+                    LOGGER.warn("Task Uid {} caught exception when interrupting RebalancingEventListener", task.getTaskUid(), e);
                     Thread.currentThread().interrupt();
                     return;
                 }
