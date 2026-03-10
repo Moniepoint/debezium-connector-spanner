@@ -152,7 +152,7 @@ public class TaskSyncEventListener {
                             }
                             catch (org.apache.kafka.common.errors.InterruptException
                                     | InterruptedException ex) {
-                                LOGGER.error("TaskSyncEventListener, caught interrupt exception {}", consumerGroup, ex);
+                                LOGGER.warn("TaskSyncEventListener, caught interrupt exception {}", consumerGroup, ex);
                                 Thread.currentThread().interrupt();
                                 return;
                             }
@@ -247,8 +247,10 @@ public class TaskSyncEventListener {
 
     private void shutdownConsumer(Consumer<String, byte[]> consumer) {
         try {
-            LOGGER.info("TaskSyncEventListener, Lost connectivity {}", consumerGroup);
-            errorHandler.accept(new SpannerConnectorException("Lost connectivity to the sync topic"));
+            if (!Thread.currentThread().isInterrupted()) {
+                LOGGER.info("TaskSyncEventListener, Lost connectivity {}", consumerGroup);
+                errorHandler.accept(new SpannerConnectorException("Lost connectivity to the sync topic"));
+            }
             LOGGER.info("TaskSyncEventListener, Shutting down consumer {}", consumerGroup);
             consumer.unsubscribe();
             consumer.close();
