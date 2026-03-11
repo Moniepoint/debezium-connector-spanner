@@ -382,6 +382,48 @@ class SpannerStreamingChangeEventSourceTest {
         verify(partitionManager).updateToReadyForStreaming("token-unavailable");
     }
 
+    /**
+     * Regression test for the ESCALATE → REPEAT_STREAMING strategy change.
+     *
+     * With ESCALATE, a stuck partition (no heartbeats for ~10 min due to a transient
+     * Spanner connectivity blip) caused a StuckPartitionException → fatal connector
+     * shutdown → zombie state (health checks passing but no data produced).
+     *
+     * With REPEAT_STREAMING, the stuck partition is reset to READY_FOR_STREAMING so
+     * TakePartitionForStreamingOperation can resubmit it once connectivity is restored,
+     * without killing the whole connector.
+     */
+    @Test
+    void onStuckPartition_partitionIsResetForRetryWithoutKillingConnector() throws Exception {
+        // Arrange
+        SynchronizedPartitionManager partitionManager = spy(
+                new SynchronizedPartitionManager((BlockingConsumer<TaskStateChangeEvent>) mock(BlockingConsumer.class)));
+
+        ChangeStream changeStream = mock(ChangeStream.class);
+
+        doAnswer(invocation -> {
+            PartitionEventListener listener = invocation.getArgument(2);
+            listener.onStuckPartition("token-stuck");
+            return null;
+        }).when(changeStream).run(any(), any(), any());
+
+        // errorHandler is intentionally null — if processFailure() were called it would NPE,
+        // proving that the connector does NOT escalate to a fatal error
+        SpannerStreamingChangeEventSource source = new SpannerStreamingChangeEventSource(
+                null, null, changeStream,
+                new StreamEventQueue(3, new MetricsEventPublisher()),
+                new MetricsEventPublisher(), partitionManager,
+                new SchemaRegistry("Stream", mock(SchemaDao.class), mock(Runnable.class)),
+                null, true, true, mock(SpannerOffsetContextFactory.class));
+
+        ChangeEventSource.ChangeEventSourceContext context = mock(ChangeEventSource.ChangeEventSourceContext.class);
+        when(context.isRunning()).thenReturn(false);
+        source.execute(context, SpannerPartition.getInitialSpannerPartition(), null);
+
+        // Assert — stuck partition is reset so it can be resubmitted for streaming
+        verify(partitionManager).updateToReadyForStreaming("token-stuck");
+    }
+
     @Test
     void testCommitRecords() throws InterruptedException {
         SynchronizedPartitionManager partitionManager = new SynchronizedPartitionManager((BlockingConsumer<TaskStateChangeEvent>) mock(BlockingConsumer.class));

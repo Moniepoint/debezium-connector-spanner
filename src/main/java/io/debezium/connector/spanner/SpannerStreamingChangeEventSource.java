@@ -34,7 +34,6 @@ import io.debezium.connector.spanner.db.model.event.FinishPartitionEvent;
 import io.debezium.connector.spanner.db.model.event.HeartbeatEvent;
 import io.debezium.connector.spanner.db.stream.ChangeStream;
 import io.debezium.connector.spanner.db.stream.PartitionEventListener;
-import io.debezium.connector.spanner.exception.FinishingPartitionTimeout;
 import io.debezium.connector.spanner.metrics.MetricsEventPublisher;
 import io.debezium.connector.spanner.metrics.event.ChildPartitionsMetricEvent;
 import io.debezium.connector.spanner.processor.SourceRecordUtils;
@@ -50,7 +49,7 @@ public class SpannerStreamingChangeEventSource implements CommittingRecordsStrea
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SpannerStreamingChangeEventSource.class);
 
-    private static final StuckPartitionStrategy STUCK_PARTITION_STRATEGY = StuckPartitionStrategy.ESCALATE;
+    private static final StuckPartitionStrategy STUCK_PARTITION_STRATEGY = StuckPartitionStrategy.REPEAT_STREAMING;
 
     private static final Duration FINISHING_PARTITION_TIMEOUT = Duration.ofSeconds(300);
 
@@ -104,7 +103,17 @@ public class SpannerStreamingChangeEventSource implements CommittingRecordsStrea
         this.spannerEventDispatcher = spannerEventDispatcher;
         this.finishingPartitionManager = new FinishingPartitionManager(connectorConfig, partitionManager::updateToFinished);
         this.finishPartitionWatchDog = new FinishPartitionWatchDog(finishingPartitionManager, FINISHING_PARTITION_TIMEOUT, tokens -> {
-            processFailure(new FinishingPartitionTimeout(tokens));
+            LOGGER.warn("FinishingPartitionTimeout for {} partition(s): {}; resetting to READY_FOR_STREAMING", tokens.size(), tokens);
+            for (String token : tokens) {
+                try {
+                    finishingPartitionManager.cancelPendingFinish(token);
+                    partitionManager.updateToReadyForStreaming(token);
+                }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
         });
 
         if (finishingAfterCommit && !waitForParents) {

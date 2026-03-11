@@ -5,6 +5,8 @@
  */
 package io.debezium.connector.spanner;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
@@ -235,6 +237,45 @@ class FinishingPartitionManagerTest {
         finishingPartitionManager.onPartitionFinishEvent("testToken");
 
         // except call consumer.accept
+        Mockito.verify(consumer, Mockito.times(1)).accept("testToken");
+    }
+
+    /**
+     * Regression test for FinishingPartitionTimeout recovery.
+     *
+     * When FinishPartitionWatchDog fires (a partition has been pending-finish for > 300s),
+     * instead of calling processFailure() the connector now calls cancelPendingFinish() +
+     * updateToReadyForStreaming(). This resets the stuck partition so it re-streams from
+     * the last committed offset rather than killing the whole connector.
+     *
+     * This test verifies that after cancelPendingFinish():
+     * 1. The partition is removed from getPendingFinishPartitions().
+     * 2. forceFinish (consumer.accept) is NOT called.
+     * 3. The partition can be re-registered for a fresh streaming cycle.
+     */
+    @Test
+    void cancelPendingFinish_removesPartitionSoItCanBeReRegistered() throws InterruptedException {
+        BlockingConsumer<String> consumer = Mockito.mock(BlockingConsumer.class);
+        SpannerConnectorConfig config = Mockito.mock(SpannerConnectorConfig.class);
+
+        FinishingPartitionManager finishingPartitionManager = new FinishingPartitionManager(config, consumer);
+
+        // Simulate: partition emitted records, finish event arrived, but last record not committed
+        finishingPartitionManager.registerPartition("testToken");
+        finishingPartitionManager.newRecord("testToken"); // lastEmitted = aaaaaaaa
+        finishingPartitionManager.onPartitionFinishEvent("testToken"); // pendingFinish = true
+
+        assertThat(finishingPartitionManager.getPendingFinishPartitions()).contains("testToken");
+
+        // FinishPartitionWatchDog timeout fires — cancel instead of fatal failure
+        finishingPartitionManager.cancelPendingFinish("testToken");
+
+        assertThat(finishingPartitionManager.getPendingFinishPartitions()).doesNotContain("testToken");
+        Mockito.verify(consumer, Mockito.times(0)).accept("testToken");
+
+        // Partition can be re-registered for a new streaming cycle (updateToReadyForStreaming path)
+        finishingPartitionManager.registerPartition("testToken");
+        finishingPartitionManager.onPartitionFinishEvent("testToken"); // no emitted record this time → forceFinish
         Mockito.verify(consumer, Mockito.times(1)).accept("testToken");
     }
 
