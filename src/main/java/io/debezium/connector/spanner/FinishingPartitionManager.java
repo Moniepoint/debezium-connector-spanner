@@ -113,6 +113,12 @@ public class FinishingPartitionManager {
         lastCommittedRecord.remove(token);
     }
 
+    public void cancelPendingFinish(String token) {
+        partitionPendingFinish.remove(token);
+        lastEmittedRecord.remove(token);
+        lastCommittedRecord.remove(token);
+    }
+
     public Set<String> getPendingFinishPartitions() {
         return partitionPendingFinish.entrySet().stream()
                 .filter(entry -> entry.getValue().equals(true))

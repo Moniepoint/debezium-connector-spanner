@@ -77,39 +77,46 @@ class TaskSyncContextTest {
         Assertions.assertEquals(taskState1.getPartitionsMap().size(), 4);
         Assertions.assertEquals(taskState1.getSharedPartitions().size(), 2);
 
-        // Build epoch update message.
+        // Build epoch update message — terminal partitions pruned.
+        // REMOVED partitions always dropped; FINISHED dropped when no CREATED child lists them as parent.
+        // In buildTaskSyncContextWithPartitions() no CREATED partition has any parents, so all FINISHED are also dropped.
         syncEvent = taskSyncContext.buildUpdateEpochTaskSyncEvent();
         Assertions.assertEquals("task0", syncEvent.getTaskUid());
         Assertions.assertEquals(3, syncEvent.getTaskStates().size());
         Assertions.assertEquals(MessageTypeEnum.UPDATE_EPOCH, syncEvent.getMessageType());
 
+        // task0: token0(CREATED) + token2(RUNNING) kept; token1(REMOVED) + token3(FINISHED) pruned → 2 partitions
+        // token4(CREATED) kept; token5(REMOVED) pruned → 1 sharedPartition
         taskState1 = syncEvent.getTaskStates().get(syncEvent.getTaskUid());
-        Assertions.assertEquals(taskState1.getPartitionsMap().size(), 4);
-        Assertions.assertEquals(taskState1.getSharedPartitions().size(), 2);
+        Assertions.assertEquals(2, taskState1.getPartitionsMap().size());
+        Assertions.assertEquals(1, taskState1.getSharedPartitions().size());
 
+        // task1: token6(REMOVED) + token7(FINISHED) both pruned → 0 partitions; token8(CREATED) kept → 1 sharedPartition
         TaskState taskState2 = syncEvent.getTaskStates().get("task1");
-        Assertions.assertEquals(taskState2.getPartitionsMap().size(), 2);
-        Assertions.assertEquals(taskState2.getSharedPartitions().size(), 1);
-        TaskState taskState3 = syncEvent.getTaskStates().get("task2");
-        Assertions.assertEquals(taskState3.getPartitionsMap().size(), 2);
-        Assertions.assertEquals(taskState3.getSharedPartitions().size(), 1);
+        Assertions.assertEquals(0, taskState2.getPartitionsMap().size());
+        Assertions.assertEquals(1, taskState2.getSharedPartitions().size());
 
-        // Build new epoch message
+        // task2: token1(CREATED) kept; token2(REMOVED) pruned → 1 partition; token3(RUNNING) kept → 1 sharedPartition
+        TaskState taskState3 = syncEvent.getTaskStates().get("task2");
+        Assertions.assertEquals(1, taskState3.getPartitionsMap().size());
+        Assertions.assertEquals(1, taskState3.getSharedPartitions().size());
+
+        // Build new epoch message — same pruning applies.
         syncEvent = taskSyncContext.buildNewEpochTaskSyncEvent();
         Assertions.assertEquals("task0", syncEvent.getTaskUid());
         Assertions.assertEquals(3, syncEvent.getTaskStates().size());
         Assertions.assertEquals(MessageTypeEnum.NEW_EPOCH, syncEvent.getMessageType());
 
         taskState1 = syncEvent.getTaskStates().get(syncEvent.getTaskUid());
-        Assertions.assertEquals(taskState1.getPartitionsMap().size(), 4);
-        Assertions.assertEquals(taskState1.getSharedPartitions().size(), 2);
+        Assertions.assertEquals(2, taskState1.getPartitionsMap().size());
+        Assertions.assertEquals(1, taskState1.getSharedPartitions().size());
 
         taskState2 = syncEvent.getTaskStates().get("task1");
-        Assertions.assertEquals(taskState2.getPartitionsMap().size(), 2);
-        Assertions.assertEquals(taskState2.getSharedPartitions().size(), 1);
+        Assertions.assertEquals(0, taskState2.getPartitionsMap().size());
+        Assertions.assertEquals(1, taskState2.getSharedPartitions().size());
         taskState3 = syncEvent.getTaskStates().get("task2");
-        Assertions.assertEquals(taskState3.getPartitionsMap().size(), 2);
-        Assertions.assertEquals(taskState3.getSharedPartitions().size(), 1);
+        Assertions.assertEquals(1, taskState3.getPartitionsMap().size());
+        Assertions.assertEquals(1, taskState3.getSharedPartitions().size());
     }
 
     private TaskSyncContext buildEmptyTaskSyncContext() {

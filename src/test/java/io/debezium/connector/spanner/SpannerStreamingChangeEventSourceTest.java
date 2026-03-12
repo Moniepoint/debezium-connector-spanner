@@ -8,6 +8,7 @@ package io.debezium.connector.spanner;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.atLeast;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
@@ -31,6 +32,8 @@ import org.junit.jupiter.api.Test;
 
 import com.google.cloud.Timestamp;
 import com.google.cloud.spanner.DatabaseClient;
+import com.google.cloud.spanner.ErrorCode;
+import com.google.cloud.spanner.SpannerExceptionFactory;
 
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
@@ -46,6 +49,8 @@ import io.debezium.connector.spanner.db.model.ModType;
 import io.debezium.connector.spanner.db.model.StreamEventMetadata;
 import io.debezium.connector.spanner.db.model.ValueCaptureType;
 import io.debezium.connector.spanner.db.model.schema.Column;
+import io.debezium.connector.spanner.db.stream.ChangeStream;
+import io.debezium.connector.spanner.db.stream.PartitionEventListener;
 import io.debezium.connector.spanner.kafka.KafkaPartitionInfoProvider;
 import io.debezium.connector.spanner.metrics.MetricsEventPublisher;
 import io.debezium.connector.spanner.processor.SpannerEventDispatcher;
@@ -62,6 +67,7 @@ import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.metrics.DefaultChangeEventSourceMetricsFactory;
 import io.debezium.pipeline.notification.NotificationService;
+import io.debezium.pipeline.source.spi.ChangeEventSource;
 import io.debezium.pipeline.source.spi.ChangeEventSourceFactory;
 import io.debezium.pipeline.spi.ChangeEventCreator;
 import io.debezium.pipeline.spi.OffsetContext;
@@ -72,6 +78,10 @@ import io.debezium.snapshot.SnapshotterService;
 import io.debezium.spi.topic.TopicNamingStrategy;
 
 class SpannerStreamingChangeEventSourceTest {
+
+    static {
+        System.setProperty("net.bytebuddy.experimental", "true");
+    }
 
     @Disabled
     @Test
@@ -138,7 +148,7 @@ class SpannerStreamingChangeEventSourceTest {
         SpannerStreamingChangeEventSource spannerStreamingChangeEventSource = new SpannerStreamingChangeEventSource(
                 connectorConfig2, errorHandler, null, eventQueue, metricsEventPublisher, partitionManager, new SchemaRegistry("Stream Name",
                         new SchemaDao(mock(DatabaseClient.class)), mock(Runnable.class)),
-                spannerEventDispatcher, true, mock(SpannerOffsetContextFactory.class));
+                spannerEventDispatcher, true, true, mock(SpannerOffsetContextFactory.class));
         Configuration configuration5 = mock(Configuration.class);
         when(configuration5.getString((Field) any())).thenReturn("String");
         when(configuration5.asProperties()).thenReturn(new Properties());
@@ -257,7 +267,7 @@ class SpannerStreamingChangeEventSourceTest {
 
         SpannerStreamingChangeEventSource spannerStreamingChangeEventSource = new SpannerStreamingChangeEventSource(
                 new SpannerConnectorConfig(configuration5), errorHandler, null, eventQueue, metricsEventPublisher, partitionManager,
-                schemaRegistryDatabaseClient, spannerEventDispatcher, true, offsetContextFactory);
+                schemaRegistryDatabaseClient, spannerEventDispatcher, true, true, offsetContextFactory);
         Timestamp commitTimestamp = Timestamp.ofTimeMicroseconds(1L);
         ArrayList<Column> rowType = new ArrayList<>();
         io.debezium.connector.spanner.db.model.event.DataChangeEvent dataChangeEvent = spy(new io.debezium.connector.spanner.db.model.event.DataChangeEvent("ABC123",
@@ -275,11 +285,143 @@ class SpannerStreamingChangeEventSourceTest {
         SpannerStreamingChangeEventSource spannerStreamingChangeEventSource = new SpannerStreamingChangeEventSource(
                 null, null, null, null, null, partitionManager, new SchemaRegistry(
                         "Stream Name", new SchemaDao(mock(DatabaseClient.class)), mock(Runnable.class)),
-                null, true, mock(SpannerOffsetContextFactory.class));
+                null, true, true, mock(SpannerOffsetContextFactory.class));
 
         spannerStreamingChangeEventSource.commitOffset(
                 Map.of("partitionToken", "v1"), Map.of("offset", Timestamp.now().toString()));
 
+    }
+
+    /**
+     * Regression test for the CANCELLED: Interrupted log-level fix.
+     *
+     * When a partition's Spanner streaming query is cancelled during task stop/restart, the
+     * gRPC layer throws a SpannerException with ErrorCode.CANCELLED. Before the fix this was
+     * logged at ERROR level, flooding dashboards with false alarms. After the fix it is WARN.
+     *
+     * Behavioural contract (verified here): regardless of whether the exception is CANCELLED or
+     * a real error, onException() MUST reset the partition to READY_FOR_STREAMING so the new
+     * task instance can pick it up.
+     */
+    @Test
+    void onException_withCancelledSpannerException_partitionIsResetForRetry() throws Exception {
+        // Arrange
+        SynchronizedPartitionManager partitionManager = spy(
+                new SynchronizedPartitionManager((BlockingConsumer<TaskStateChangeEvent>) mock(BlockingConsumer.class)));
+
+        ChangeStream changeStream = mock(ChangeStream.class);
+
+        com.google.cloud.spanner.SpannerException cancelled = SpannerExceptionFactory
+                .newSpannerException(ErrorCode.CANCELLED, "Interrupted");
+
+        io.debezium.connector.spanner.db.model.Partition partition = io.debezium.connector.spanner.db.model.Partition.builder()
+                .token("token-cancelled")
+                .parentTokens(java.util.Set.of("Parent0"))
+                .startTimestamp(com.google.cloud.Timestamp.now())
+                .build();
+
+        // When execute() calls stream.run(), fire onException with the CANCELLED exception
+        doAnswer(invocation -> {
+            PartitionEventListener listener = invocation.getArgument(2);
+            listener.onException(partition, cancelled);
+            return null;
+        }).when(changeStream).run(any(), any(), any());
+
+        SpannerStreamingChangeEventSource source = new SpannerStreamingChangeEventSource(
+                null, null, changeStream,
+                new StreamEventQueue(3, new MetricsEventPublisher()),
+                new MetricsEventPublisher(), partitionManager,
+                new SchemaRegistry("Stream", mock(SchemaDao.class), mock(Runnable.class)),
+                null, true, true, mock(SpannerOffsetContextFactory.class));
+
+        // Act — mock a context that is not running so the inner processing thread exits cleanly
+        ChangeEventSource.ChangeEventSourceContext context = mock(ChangeEventSource.ChangeEventSourceContext.class);
+        when(context.isRunning()).thenReturn(false);
+        source.execute(context, SpannerPartition.getInitialSpannerPartition(), null);
+
+        // Assert — partition must be reset so the new task instance can pick it up
+        verify(partitionManager).updateToReadyForStreaming("token-cancelled");
+    }
+
+    @Test
+    void onException_withNonCancelledSpannerException_partitionIsAlsoResetForRetry() throws Exception {
+        // Arrange
+        SynchronizedPartitionManager partitionManager = spy(
+                new SynchronizedPartitionManager((BlockingConsumer<TaskStateChangeEvent>) mock(BlockingConsumer.class)));
+
+        ChangeStream changeStream = mock(ChangeStream.class);
+
+        // A real (non-CANCELLED) Spanner error — connectivity loss
+        com.google.cloud.spanner.SpannerException unavailable = SpannerExceptionFactory
+                .newSpannerException(ErrorCode.UNAVAILABLE, "connection reset");
+
+        io.debezium.connector.spanner.db.model.Partition partition = io.debezium.connector.spanner.db.model.Partition.builder()
+                .token("token-unavailable")
+                .parentTokens(java.util.Set.of("Parent0"))
+                .startTimestamp(com.google.cloud.Timestamp.now())
+                .build();
+
+        doAnswer(invocation -> {
+            PartitionEventListener listener = invocation.getArgument(2);
+            listener.onException(partition, unavailable);
+            return null;
+        }).when(changeStream).run(any(), any(), any());
+
+        SpannerStreamingChangeEventSource source = new SpannerStreamingChangeEventSource(
+                null, null, changeStream,
+                new StreamEventQueue(3, new MetricsEventPublisher()),
+                new MetricsEventPublisher(), partitionManager,
+                new SchemaRegistry("Stream", mock(SchemaDao.class), mock(Runnable.class)),
+                null, true, true, mock(SpannerOffsetContextFactory.class));
+
+        ChangeEventSource.ChangeEventSourceContext context = mock(ChangeEventSource.ChangeEventSourceContext.class);
+        when(context.isRunning()).thenReturn(false);
+        source.execute(context, SpannerPartition.getInitialSpannerPartition(), null);
+
+        // Non-CANCELLED exceptions also reset the partition for retry — no behaviour change
+        verify(partitionManager).updateToReadyForStreaming("token-unavailable");
+    }
+
+    /**
+     * Regression test for the ESCALATE → REPEAT_STREAMING strategy change.
+     *
+     * With ESCALATE, a stuck partition (no heartbeats for ~10 min due to a transient
+     * Spanner connectivity blip) caused a StuckPartitionException → fatal connector
+     * shutdown → zombie state (health checks passing but no data produced).
+     *
+     * With REPEAT_STREAMING, the stuck partition is reset to READY_FOR_STREAMING so
+     * TakePartitionForStreamingOperation can resubmit it once connectivity is restored,
+     * without killing the whole connector.
+     */
+    @Test
+    void onStuckPartition_partitionIsResetForRetryWithoutKillingConnector() throws Exception {
+        // Arrange
+        SynchronizedPartitionManager partitionManager = spy(
+                new SynchronizedPartitionManager((BlockingConsumer<TaskStateChangeEvent>) mock(BlockingConsumer.class)));
+
+        ChangeStream changeStream = mock(ChangeStream.class);
+
+        doAnswer(invocation -> {
+            PartitionEventListener listener = invocation.getArgument(2);
+            listener.onStuckPartition("token-stuck");
+            return null;
+        }).when(changeStream).run(any(), any(), any());
+
+        // errorHandler is intentionally null — if processFailure() were called it would NPE,
+        // proving that the connector does NOT escalate to a fatal error
+        SpannerStreamingChangeEventSource source = new SpannerStreamingChangeEventSource(
+                null, null, changeStream,
+                new StreamEventQueue(3, new MetricsEventPublisher()),
+                new MetricsEventPublisher(), partitionManager,
+                new SchemaRegistry("Stream", mock(SchemaDao.class), mock(Runnable.class)),
+                null, true, true, mock(SpannerOffsetContextFactory.class));
+
+        ChangeEventSource.ChangeEventSourceContext context = mock(ChangeEventSource.ChangeEventSourceContext.class);
+        when(context.isRunning()).thenReturn(false);
+        source.execute(context, SpannerPartition.getInitialSpannerPartition(), null);
+
+        // Assert — stuck partition is reset so it can be resubmitted for streaming
+        verify(partitionManager).updateToReadyForStreaming("token-stuck");
     }
 
     @Test
@@ -289,7 +431,7 @@ class SpannerStreamingChangeEventSourceTest {
         SpannerStreamingChangeEventSource spannerStreamingChangeEventSource = new SpannerStreamingChangeEventSource(
                 null, null, null, null, null, partitionManager, new SchemaRegistry(
                         "Stream Name", new SchemaDao(mock(DatabaseClient.class)), mock(Runnable.class)),
-                null, true, mock(SpannerOffsetContextFactory.class));
+                null, true, true, mock(SpannerOffsetContextFactory.class));
 
         SourceRecord sourceRecord1 = spy(new SourceRecord(Map.of(), Map.of(), "t1", Schema.STRING_SCHEMA, "v1"));
         SourceRecord sourceRecord2 = spy(new SourceRecord(Map.of(), Map.of(), "t2", Schema.STRING_SCHEMA, "v2"));

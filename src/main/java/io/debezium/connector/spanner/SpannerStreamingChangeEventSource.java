@@ -16,6 +16,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.cloud.Timestamp;
+import com.google.cloud.spanner.ErrorCode;
+import com.google.cloud.spanner.SpannerException;
 import com.google.common.annotations.VisibleForTesting;
 
 import io.debezium.connector.spanner.context.offset.SpannerOffsetContext;
@@ -32,7 +34,6 @@ import io.debezium.connector.spanner.db.model.event.FinishPartitionEvent;
 import io.debezium.connector.spanner.db.model.event.HeartbeatEvent;
 import io.debezium.connector.spanner.db.stream.ChangeStream;
 import io.debezium.connector.spanner.db.stream.PartitionEventListener;
-import io.debezium.connector.spanner.exception.FinishingPartitionTimeout;
 import io.debezium.connector.spanner.metrics.MetricsEventPublisher;
 import io.debezium.connector.spanner.metrics.event.ChildPartitionsMetricEvent;
 import io.debezium.connector.spanner.processor.SourceRecordUtils;
@@ -48,7 +49,7 @@ public class SpannerStreamingChangeEventSource implements CommittingRecordsStrea
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SpannerStreamingChangeEventSource.class);
 
-    private static final StuckPartitionStrategy STUCK_PARTITION_STRATEGY = StuckPartitionStrategy.ESCALATE;
+    private static final StuckPartitionStrategy STUCK_PARTITION_STRATEGY = StuckPartitionStrategy.REPEAT_STREAMING;
 
     private static final Duration FINISHING_PARTITION_TIMEOUT = Duration.ofSeconds(300);
 
@@ -89,6 +90,7 @@ public class SpannerStreamingChangeEventSource implements CommittingRecordsStrea
                                              SchemaRegistry schemaRegistry,
                                              SpannerEventDispatcher spannerEventDispatcher,
                                              boolean finishingAfterCommit,
+                                             boolean waitForParents,
                                              SpannerOffsetContextFactory offsetContextFactory) {
         this.connectorConfig = connectorConfig;
         this.offsetContextFactory = offsetContextFactory;
@@ -101,12 +103,27 @@ public class SpannerStreamingChangeEventSource implements CommittingRecordsStrea
         this.spannerEventDispatcher = spannerEventDispatcher;
         this.finishingPartitionManager = new FinishingPartitionManager(connectorConfig, partitionManager::updateToFinished);
         this.finishPartitionWatchDog = new FinishPartitionWatchDog(finishingPartitionManager, FINISHING_PARTITION_TIMEOUT, tokens -> {
-            processFailure(new FinishingPartitionTimeout(tokens));
+            LOGGER.warn("FinishingPartitionTimeout for {} partition(s): {}; resetting to READY_FOR_STREAMING", tokens.size(), tokens);
+            for (String token : tokens) {
+                try {
+                    finishingPartitionManager.cancelPendingFinish(token);
+                    partitionManager.updateToReadyForStreaming(token);
+                }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
         });
 
-        this.finishPartitionStrategy = finishingAfterCommit
-                ? FinishPartitionStrategy.AFTER_COMMIT
-                : FinishPartitionStrategy.AFTER_STREAMING_FINISH;
+        if (finishingAfterCommit && !waitForParents) {
+            this.finishPartitionStrategy = FinishPartitionStrategy.AFTER_COMMIT_NO_PARENT_WAIT;
+        }
+        else {
+            this.finishPartitionStrategy = finishingAfterCommit
+                    ? FinishPartitionStrategy.AFTER_COMMIT
+                    : FinishPartitionStrategy.AFTER_STREAMING_FINISH;
+        }
     }
 
     @Override
@@ -134,9 +151,15 @@ public class SpannerStreamingChangeEventSource implements CommittingRecordsStrea
 
                 @Override
                 public void onException(Partition partition, Exception exception) throws InterruptedException {
-                    LOGGER.error("Try to stream again from partition {} after exception {}", partition.getToken(),
-                            exception.getMessage());
-
+                    if (exception instanceof SpannerException
+                            && ((SpannerException) exception).getErrorCode() == ErrorCode.CANCELLED) {
+                        LOGGER.warn("Partition {} streaming was cancelled (task stop/restart), will retry",
+                                partition.getToken());
+                    }
+                    else {
+                        LOGGER.error("Try to stream again from partition {} after exception {}", partition.getToken(),
+                                exception.getMessage());
+                    }
                     partitionManager.updateToReadyForStreaming(partition.getToken());
                 }
 
@@ -232,7 +255,8 @@ public class SpannerStreamingChangeEventSource implements CommittingRecordsStrea
 
                         LOGGER.info("Received FinishPartitionEvent for partition {}", event.getMetadata().getPartitionToken());
 
-                        if (finishPartitionStrategy.equals(FinishPartitionStrategy.AFTER_COMMIT)) {
+                        if (finishPartitionStrategy.equals(FinishPartitionStrategy.AFTER_COMMIT)
+                                || finishPartitionStrategy.equals(FinishPartitionStrategy.AFTER_COMMIT_NO_PARENT_WAIT)) {
                             this.finishingPartitionManager.onPartitionFinishEvent(event.getMetadata().getPartitionToken());
                         }
                         else if (finishPartitionStrategy.equals(FinishPartitionStrategy.AFTER_STREAMING_FINISH)) {
@@ -328,7 +352,8 @@ public class SpannerStreamingChangeEventSource implements CommittingRecordsStrea
     @Override
     public void commitRecords(List<SourceRecord> records) throws InterruptedException {
 
-        if (!finishPartitionStrategy.equals(FinishPartitionStrategy.AFTER_COMMIT)) {
+        if (!finishPartitionStrategy.equals(FinishPartitionStrategy.AFTER_COMMIT)
+                && !finishPartitionStrategy.equals(FinishPartitionStrategy.AFTER_COMMIT_NO_PARENT_WAIT)) {
             return;
         }
 

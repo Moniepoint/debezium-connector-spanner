@@ -110,7 +110,7 @@ public class PartitionOffsetProvider {
         }
         catch (InterruptedException e) {
             // handle the interrupts
-            LOGGER.error("Token {},interrupting PartitionOffsetProvider", spannerPartition, e);
+            LOGGER.warn("Token {},interrupting PartitionOffsetProvider", spannerPartition, e);
             Thread.currentThread().interrupt();
         }
         catch (ExecutionException e) {
