@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -35,94 +36,65 @@ import io.debezium.connector.spanner.task.PartitionFactory;
 import io.debezium.connector.spanner.task.TaskSyncContext;
 
 /**
- * Tests for the interrupt-cascade fix in TakePartitionForStreamingOperation.
+ * Tests for TakePartitionForStreamingOperation.
  *
- * Scenario being tested:
- *   During AFTER_COMMIT_NO_PARENT_WAIT epoch transition, stopProcessing() interrupts the
- *   TaskStateChangeEventProcessor thread while it is inside future.get() in retrieveOffsetMap().
- *   That catch block calls Thread.currentThread().interrupt(), setting the flag on the caller.
- *   Without the fix (forEach), every subsequent partition would fail instantly and log an ERROR.
- *   With the fix (for-loop + isInterrupted() check), the loop breaks after the first interrupted
- *   partition and the remaining ones are left untouched for the new task instance to handle.
+ * Since PartitionFactory.getPartitions() bulk-loads offsets before the submission loop,
+ * interrupt scenarios are tested by setting the interrupt flag either during the bulk
+ * load (getPartitions override) or during changeStream.submitPartition().
  *
  * Note: PartitionFactory is a concrete class that cannot be mocked on Java 25 with Mockito inline
- * mocks. We use anonymous subclasses with AtomicInteger call counters instead.
+ * mocks. We use anonymous subclasses instead.
  */
 class TakePartitionForStreamingOperationTest {
 
     @AfterEach
     void clearInterruptFlag() {
-        // Ensure interrupt flag never leaks between tests
         Thread.interrupted();
     }
 
     /**
-     * Core regression test for the cascade fix.
-     *
-     * The first partition's processing sets the interrupt flag (as retrieveOffsetMap() does when
-     * future.get() is interrupted). The loop must break immediately on the second iteration check,
-     * so partitionFactory.getPartition() is called exactly once — not N times.
+     * When the thread is interrupted during the bulk offset load (getPartitions), the
+     * loop's isInterrupted() check fires on the first iteration and nothing is submitted.
      */
     @Test
-    void whenInterruptFlagSetDuringFirstPartition_loopBreaksAndRemainingPartitionsAreSkipped() {
-        AtomicInteger getPartitionCalls = new AtomicInteger(0);
-        Partition dummyPartition = buildPartition("token-0");
-
+    void whenInterruptFlagSetDuringBulkLoad_loopNeverSubmitsAnyPartition() {
         PartitionFactory partitionFactory = new PartitionFactory(null, new MetricsEventPublisher()) {
             @Override
-            public Partition getPartition(PartitionState ps) {
-                getPartitionCalls.incrementAndGet();
-                // Simulates what retrieveOffsetMap() does after catching InterruptedException:
-                // sets the thread interrupt flag then returns (getOffset falls back to startTimestamp).
+            public List<Partition> getPartitions(List<PartitionState> psList) {
+                // Simulates retrieveOffsetMap() catching InterruptedException and re-setting the flag
                 Thread.currentThread().interrupt();
-                return dummyPartition;
+                return psList.stream().map(ps -> buildPartition(ps.getToken())).collect(Collectors.toList());
             }
         };
 
         ChangeStream changeStream = mock(ChangeStream.class);
-        when(changeStream.submitPartition(any())).thenReturn(false);
 
         TaskSyncContext context = buildContextWithReadyPartitions(3);
         new TakePartitionForStreamingOperation(changeStream, partitionFactory).doOperation(context);
 
-        // Loop must have broken after the first partition
-        assertThat(getPartitionCalls.get())
-                .as("getPartition() must be called only once before the loop breaks")
-                .isEqualTo(1);
-        verify(changeStream, times(1)).submitPartition(any());
-
-        // Interrupt flag must still be set — not swallowed
+        verify(changeStream, never()).submitPartition(any());
         assertThat(Thread.currentThread().isInterrupted()).isTrue();
     }
 
     /**
-     * Verifies the other edge of the fix: when the thread is already interrupted *before*
-     * the loop starts (possible if a prior operation already set the flag), the isInterrupted()
-     * check fires on the very first iteration and nothing is submitted at all.
+     * When the thread is already interrupted before the operation starts, the loop's
+     * first isInterrupted() check fires and all partitions are skipped entirely.
      */
     @Test
     void whenThreadAlreadyInterruptedBeforeLoop_allPartitionsSkipped() {
-        AtomicInteger getPartitionCalls = new AtomicInteger(0);
-
         PartitionFactory partitionFactory = new PartitionFactory(null, new MetricsEventPublisher()) {
             @Override
-            public Partition getPartition(PartitionState ps) {
-                getPartitionCalls.incrementAndGet();
-                return buildPartition(ps.getToken());
+            public List<Partition> getPartitions(List<PartitionState> psList) {
+                return psList.stream().map(ps -> buildPartition(ps.getToken())).collect(Collectors.toList());
             }
         };
 
         ChangeStream changeStream = mock(ChangeStream.class);
 
         TaskSyncContext context = buildContextWithReadyPartitions(3);
-
-        // Pre-interrupt: simulates the state AFTER a prior retrieveOffsetMap() call set the flag
         Thread.currentThread().interrupt();
         new TakePartitionForStreamingOperation(changeStream, partitionFactory).doOperation(context);
 
-        assertThat(getPartitionCalls.get())
-                .as("no partition should be processed when thread is already interrupted")
-                .isEqualTo(0);
         verify(changeStream, never()).submitPartition(any());
         assertThat(Thread.currentThread().isInterrupted()).isTrue();
     }
@@ -133,13 +105,10 @@ class TakePartitionForStreamingOperationTest {
      */
     @Test
     void withoutInterrupt_allReadyForStreamingPartitionsAreScheduled() {
-        AtomicInteger getPartitionCalls = new AtomicInteger(0);
-
         PartitionFactory partitionFactory = new PartitionFactory(null, new MetricsEventPublisher()) {
             @Override
-            public Partition getPartition(PartitionState ps) {
-                getPartitionCalls.incrementAndGet();
-                return buildPartition(ps.getToken());
+            public List<Partition> getPartitions(List<PartitionState> psList) {
+                return psList.stream().map(ps -> buildPartition(ps.getToken())).collect(Collectors.toList());
             }
         };
 
@@ -150,9 +119,6 @@ class TakePartitionForStreamingOperationTest {
         TaskSyncContext result = new TakePartitionForStreamingOperation(changeStream, partitionFactory)
                 .doOperation(context);
 
-        assertThat(getPartitionCalls.get())
-                .as("all 3 partitions must be processed without interrupt")
-                .isEqualTo(3);
         verify(changeStream, times(3)).submitPartition(any());
 
         long scheduledCount = result.getCurrentTaskState().getPartitions().stream()
@@ -163,33 +129,33 @@ class TakePartitionForStreamingOperationTest {
     }
 
     /**
-     * Verifies that partitions which were not reached by the loop (because the interrupt fired
-     * mid-batch) remain in READY_FOR_STREAMING state, so the new task instance can pick them up.
+     * When the interrupt flag is set during the first submitPartition() call, the loop breaks
+     * on the second iteration's isInterrupted() check. Remaining partitions stay READY_FOR_STREAMING.
      */
     @Test
     void whenInterruptMidBatch_unprocessedPartitionsStayReadyForStreaming() {
-        AtomicInteger getPartitionCalls = new AtomicInteger(0);
-
         PartitionFactory partitionFactory = new PartitionFactory(null, new MetricsEventPublisher()) {
             @Override
-            public Partition getPartition(PartitionState ps) {
-                int call = getPartitionCalls.incrementAndGet();
-                if (call == 1) {
-                    Thread.currentThread().interrupt(); // first partition triggers the cascade point
-                }
-                return buildPartition(ps.getToken());
+            public List<Partition> getPartitions(List<PartitionState> psList) {
+                return psList.stream().map(ps -> buildPartition(ps.getToken())).collect(Collectors.toList());
             }
         };
 
+        AtomicInteger submitCalls = new AtomicInteger();
         ChangeStream changeStream = mock(ChangeStream.class);
-        when(changeStream.submitPartition(any())).thenReturn(false);
+        when(changeStream.submitPartition(any())).thenAnswer(inv -> {
+            if (submitCalls.incrementAndGet() == 1) {
+                Thread.currentThread().interrupt();
+            }
+            return false;
+        });
 
         TaskSyncContext context = buildContextWithReadyPartitions(3);
         TaskSyncContext result = new TakePartitionForStreamingOperation(changeStream, partitionFactory)
                 .doOperation(context);
 
-        // Only first partition was attempted
-        assertThat(getPartitionCalls.get()).isEqualTo(1);
+        // Only first partition was attempted before loop broke
+        assertThat(submitCalls.get()).isEqualTo(1);
 
         // All 3 must still be READY_FOR_STREAMING — none promoted to SCHEDULED
         long readyCount = result.getCurrentTaskState().getPartitions().stream()
@@ -201,31 +167,27 @@ class TakePartitionForStreamingOperationTest {
     }
 
     /**
-     * When the ChangeStream is not yet running (isRunning=false), submitPartition() returns false.
-     * This is a transient window during task/epoch restart — the partition must stay in
-     * READY_FOR_STREAMING so the next sync event retries submission automatically.
-     * No sync event should be published (nothing was scheduled).
+     * When the ChangeStream is not yet running, submitPartition() returns false.
+     * All partitions must stay READY_FOR_STREAMING for the next retry and no sync event published.
      */
     @Test
     void whenChangeStreamNotRunning_allPartitionsStayReadyForStreamingForRetry() {
         PartitionFactory partitionFactory = new PartitionFactory(null, new MetricsEventPublisher()) {
             @Override
-            public Partition getPartition(PartitionState ps) {
-                return buildPartition(ps.getToken());
+            public List<Partition> getPartitions(List<PartitionState> psList) {
+                return psList.stream().map(ps -> buildPartition(ps.getToken())).collect(Collectors.toList());
             }
         };
 
         ChangeStream changeStream = mock(ChangeStream.class);
-        when(changeStream.submitPartition(any())).thenReturn(false); // stream not yet running
+        when(changeStream.submitPartition(any())).thenReturn(false);
 
         TaskSyncContext context = buildContextWithReadyPartitions(3);
         TakePartitionForStreamingOperation op = new TakePartitionForStreamingOperation(changeStream, partitionFactory);
         TaskSyncContext result = op.doOperation(context);
 
-        // All 3 were attempted (no interrupt)
         verify(changeStream, times(3)).submitPartition(any());
 
-        // None transitioned to SCHEDULED — stay READY_FOR_STREAMING for the next retry
         long readyCount = result.getCurrentTaskState().getPartitions().stream()
                 .filter(p -> p.getState() == PartitionStateEnum.READY_FOR_STREAMING)
                 .count();
@@ -233,7 +195,6 @@ class TakePartitionForStreamingOperationTest {
                 .as("partitions must stay READY_FOR_STREAMING when stream is not running")
                 .isEqualTo(3);
 
-        // No sync event published — nothing was scheduled
         assertThat(op.isRequiredPublishSyncEvent())
                 .as("no sync event should be published when no partition was scheduled")
                 .isFalse();
