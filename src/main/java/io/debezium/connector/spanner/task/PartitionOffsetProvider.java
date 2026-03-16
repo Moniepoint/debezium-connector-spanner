@@ -79,7 +79,20 @@ public class PartitionOffsetProvider {
                 .map(token -> new SpannerPartition(token).getSourcePartition())
                 .collect(Collectors.toList());
 
-        Map<Map<String, String>, Map<String, Object>> result = this.offsetStorageReader.offsets(partitionsMapList);
+        Map<Map<String, String>, Map<String, Object>> result;
+        try {
+            result = this.offsetStorageReader.offsets(partitionsMapList);
+        }
+        catch (org.apache.kafka.connect.errors.ConnectException e) {
+            if (e.getCause() instanceof InterruptedException) {
+                LOGGER.warn("Interrupted while fetching bulk offsets for {} partitions, returning empty map", partitions.size());
+                Thread.currentThread().interrupt();
+            }
+            else {
+                LOGGER.error("Failed to fetch bulk offsets for {} partitions", partitions.size(), e);
+            }
+            return Map.of();
+        }
 
         if (result == null) {
             return Map.of();

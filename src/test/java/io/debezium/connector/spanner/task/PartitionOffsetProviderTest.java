@@ -10,11 +10,14 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.storage.OffsetStorageReader;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -150,6 +153,30 @@ class PartitionOffsetProviderTest {
 
         assertThat(result).isEqualTo(startTimestamp);
         assertThat(Thread.currentThread().isInterrupted()).isFalse();
+    }
+
+    /**
+     * Reproduces the scenario observed in 16032026-debezium.log:
+     * the task thread is interrupted during shutdown while getOffsets() is blocked inside
+     * OffsetStorageReaderImpl.offsets(). The Kafka Connect framework wraps the
+     * InterruptedException in a ConnectException. Without the fix this propagated uncaught,
+     * generating a noisy ERROR log and a "follow-up failure exception" entry.
+     *
+     * After the fix getOffsets() must:
+     *   1. Return an empty map (callers fall back to startTimestamp).
+     *   2. Re-set the interrupt flag so the task shutdown sequence sees it.
+     */
+    @Test
+    void whenOffsetStorageReaderThrowsConnectExceptionWrappingInterrupt_getOffsetsReturnsEmptyMapAndRestoresFlag() {
+        OffsetStorageReader reader = mock(OffsetStorageReader.class);
+        when(reader.offsets(any())).thenThrow(new ConnectException(new InterruptedException("simulated shutdown interrupt")));
+
+        PartitionOffsetProvider provider = new PartitionOffsetProvider(reader, new MetricsEventPublisher());
+
+        Map<String, com.google.cloud.Timestamp> result = provider.getOffsets(List.of("token-A", "token-B"));
+
+        assertThat(result).as("must return empty map when interrupted").isEmpty();
+        assertThat(Thread.currentThread().isInterrupted()).as("interrupt flag must be re-set").isTrue();
     }
 
     // ---- helpers ----

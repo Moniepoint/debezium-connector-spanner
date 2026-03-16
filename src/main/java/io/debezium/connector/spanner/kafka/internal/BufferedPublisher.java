@@ -91,7 +91,7 @@ public class BufferedPublisher<V> {
         }
     }
 
-    private void publishBuffered() {
+    private synchronized void publishBuffered() {
         TaskSyncContext context = taskSyncContextHolder.get();
         if (context == null || context.getRebalanceState() != RebalanceState.NEW_EPOCH_STARTED) {
             return;

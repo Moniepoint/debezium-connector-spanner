@@ -8,6 +8,7 @@ package io.debezium.connector.spanner.task.operation;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -54,13 +55,18 @@ public class TakePartitionForStreamingOperation implements Operation {
         try {
             Set<String> toSchedule = new HashSet<>();
 
+            // Bulk-load all offsets in one call (no per-partition timeout) before submitting
+            Map<String, Partition> partitionsByToken = partitionFactory.getPartitions(toStreaming).stream()
+                    .collect(Collectors.toMap(Partition::getToken, p -> p));
+
             for (PartitionState partitionState : toStreaming) {
                 if (Thread.currentThread().isInterrupted()) {
                     LOGGER.info("Task {}, stopping partition submission - thread was interrupted", taskSyncContext.getTaskUid());
                     break;
                 }
                 LOGGER.info("Task {}, submitting the partition for streaming {}", taskSyncContext.getTaskUid(), partitionState);
-                if (this.submitPartition(partitionState, taskSyncContext)) {
+                Partition partition = partitionsByToken.get(partitionState.getToken());
+                if (partition != null && changeStream.submitPartition(partition)) {
                     toSchedule.add(partitionState.getToken());
                 }
                 else {
@@ -92,13 +98,6 @@ public class TakePartitionForStreamingOperation implements Operation {
         finally {
             LOGGER.debug("Task {}, finished trying to take partitions for streaming {}", taskSyncContext.getTaskUid());
         }
-    }
-
-    private boolean submitPartition(PartitionState partitionState, TaskSyncContext taskSyncContext) {
-
-        Partition partition = partitionFactory.getPartition(partitionState);
-
-        return changeStream.submitPartition(partition);
     }
 
     private TaskSyncContext removeAlreadyStreamingPartitions(TaskSyncContext taskSyncContext) {
